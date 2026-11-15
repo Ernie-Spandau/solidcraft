@@ -6288,6 +6288,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             ("solid.offset_face", with_single_body(json!({"faces": face_points(0)}), sels(d, 0)))
         }
         Kind::Thread { designation, length, suggested, options, .. } => {
+            if let Some(error) = &options.tpi_error {
+                return Err(format!("Pitch (TPI): {error}"));
+            }
             need(0, "a cylindrical face")?;
             let mut p = json!({"face": face_points(0).into_iter().next().unwrap_or(Value::Null)});
             if !designation.trim().is_empty() && suggested.as_deref() != Some(designation.as_str()) {
