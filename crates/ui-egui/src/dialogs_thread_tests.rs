@@ -355,3 +355,33 @@ fn a_saved_thread_reopens_with_every_option() {
         h.app.session.execute(&cmd, &params).unwrap_or_else(|e| panic!("{made}: OK on the reopened dialog: {e}"));
     }
 }
+
+#[test]
+fn tpi_entry_preserves_integer_input_and_converts_exactly() {
+    assert_eq!(format_tpi(28.0), "28");
+    assert!((tpi_pitch("28").unwrap() - 25.4 / 28.0).abs() < 1e-12);
+    assert!((tpi_pitch("16").unwrap() - 1.5875).abs() < 1e-12);
+    for bad in ["", " ", "0", "-28", "abc", "NaN", "inf"] {
+        assert!(tpi_pitch(bad).is_err(), "{bad:?} should not be accepted");
+    }
+}
+
+#[test]
+fn precise_thread_designation_round_trips_tpi() {
+    let pitch = tpi_pitch("28").unwrap();
+    let name = precise_designation(ThreadForm::Metric, 13.607142857, pitch);
+    let (major, parsed_pitch) = parse(ThreadForm::Metric, &name).unwrap();
+    assert!((major - 13.607142857).abs() < 1e-10);
+    assert!((25.4 / parsed_pitch - 28.0).abs() < 1e-9, "{name}");
+}
+
+#[test]
+fn invalid_tpi_draft_prevents_applying_previous_valid_thread() {
+    let mut h = shaft();
+    if let Kind::Thread { options, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        options.tpi_draft = Some(String::new());
+        options.tpi_error = Some("enter a positive TPI value".into());
+    }
+    let err = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap_err();
+    assert!(err.contains("Pitch (TPI)"), "{err}");
+}
