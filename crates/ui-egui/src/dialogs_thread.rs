@@ -450,6 +450,24 @@ pub(crate) fn rows(
     if !f.sizes().is_empty() {
         size_rows(ui, f, designation, suggested);
     }
+    // Offer a unit-independent pitch entry for forms whose designations accept a
+    // numeric millimetre pitch. The engine still receives its normal designation.
+    // Pipe threads have fixed catalogue pitches; ACME/ASME buttress already use TPI.
+    if !inch(f) && !is_pipe(f)
+        && let Some((diameter, pitch)) = parse(f, designation)
+    {
+        let mut tpi = 25.4 / pitch;
+        form_row(ui, "Pitch (TPI)", |ui| {
+            let response = ui.add(egui::DragValue::new(&mut tpi).speed(0.1).range(0.01..=10000.0).suffix(" TPI"));
+            if response.changed() && tpi.is_finite() && tpi > 0.0 {
+                let new_pitch = 25.4 / tpi;
+                if new_pitch < diameter {
+                    *designation = designation_of(f, diameter, new_pitch);
+                    *suggested = None;
+                }
+            }
+        });
+    }
     let hint = solidcraft_ui_text::format("thread.fits_the_face", &[("example", &example(f))]);
     let (submitted, changed) = text_row(ui, "Designation", designation, &hint);
     enter |= submitted;
