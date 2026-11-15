@@ -361,6 +361,39 @@ fn designation_of(form: ThreadForm, d: f64, p: f64) -> String {
     form.format(d, p, p)
 }
 
+fn tpi_pitch(input: &str) -> Result<f64, &'static str> {
+    let tpi = input.trim().parse::<f64>().map_err(|_| "enter a positive TPI value")?;
+    if !tpi.is_finite() || tpi <= 0.0 {
+        return Err("enter a positive TPI value");
+    }
+    let pitch = 25.4 / tpi;
+    if !pitch.is_finite() || pitch <= 0.0 {
+        return Err("TPI is outside the supported range");
+    }
+    Ok(pitch)
+}
+
+fn format_tpi(tpi: f64) -> String {
+    // Show integers as integers, without feeding the rounded designation back
+    // into an active text editor.
+    if (tpi - tpi.round()).abs() < 1e-5 {
+        format!("{:.0}", tpi)
+    } else {
+        format!("{tpi:.8}")
+    }
+}
+
+fn precise_designation(form: ThreadForm, diameter: f64, pitch: f64) -> String {
+    let number = |n: f64| format!("{n:.12}").trim_end_matches('0').trim_end_matches('.').to_owned();
+    let prefix = match form {
+        ThreadForm::Metric => "M",
+        ThreadForm::Trapezoidal => "Tr",
+        ThreadForm::Buttress => "S",
+        _ => return designation_of(form, diameter, pitch),
+    };
+    format!("{prefix}{}x{}", number(diameter), number(pitch))
+}
+
 /// The pitches the Pitch choice offers for diameter `d` (largest first), with the current one.
 fn pitches(form: ThreadForm, d: f64, current: f64) -> Vec<f64> {
     let standard = form.sizes().into_iter().find(|(n, _)| same(*n, d)).map(|(_, p)| p);
@@ -474,11 +507,11 @@ pub(crate) fn rows(
     if !f.sizes().is_empty() {
         size_rows(ui, f, designation, suggested);
     }
-    // A text buffer is deliberately separate from the parsed designation. Editing
-    // "28" through "" or "2" must not rewrite the widget on the next frame.
+    // Keep the user's text independent of the formatted designation: typing "28"
+    // must not turn into "27.99999559" after the engine rounds a pitch.
     if !inch(f) && !is_pipe(f) {
         if o.tpi_draft.is_none() || (o.tpi_error.is_none() && o.tpi_source != *designation) {
-            o.tpi_draft = parse(f, designation).map(|(_, p)| format!("{:.8}", 25.4 / p));
+            o.tpi_draft = parse(f, designation).map(|(_, p)| format_tpi(25.4 / p));
             o.tpi_source = designation.clone();
             o.tpi_error = None;
         }
@@ -486,19 +519,20 @@ pub(crate) fn rows(
             let (submitted, changed) = text_row(ui, "Pitch (TPI)", draft, "threads per inch");
             enter |= submitted && o.tpi_error.is_none();
             if changed {
-                let parsed = draft.trim().parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0);
-                match parsed {
-                    Some(tpi) if 25.4 / tpi > 0.0 => {
-                        let pitch = 25.4 / tpi;
-                        if o.geometry_size {
-                            // Re-query the face with the new pitch next frame.
-                            o.tpi_error = None;
-                            *suggested = None;
-                            designation.clear();
-                            reset = true;
-                        } else if let Some((diameter, _)) = parse(f, designation) {
-                            if pitch < diameter {
-                                *designation = designation_of(f, diameter, pitch);
+                match tpi_pitch(draft) {
+                    Ok(pitch) => {
+                        if let Some((diameter, old_pitch)) = parse(f, designation) {
+                            // A geometry-sized bore keeps its drill diameter fixed when
+                            // pitch changes. An external shaft keeps its major diameter.
+                            // For geometry-sized holes, the old nominal-to-drill offset
+                            // is retained until the face is selected again.
+                            let major = if o.geometry_size {
+                                diameter + o.form.drill(diameter, old_pitch) - o.form.drill(diameter, pitch)
+                            } else {
+                                diameter
+                            };
+                            if pitch < major && major.is_finite() && major > 0.0 {
+                                *designation = precise_designation(f, major, pitch);
                                 *suggested = None;
                                 o.tpi_source = designation.clone();
                                 o.tpi_error = None;
@@ -509,7 +543,7 @@ pub(crate) fn rows(
                             o.tpi_error = Some("select a thread size first".into());
                         }
                     }
-                    _ => o.tpi_error = Some("enter a positive TPI value".into()),
+                    Err(error) => o.tpi_error = Some(error.into()),
                 }
             }
             if let Some(error) = &o.tpi_error {
