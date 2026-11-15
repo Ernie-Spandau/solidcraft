@@ -297,6 +297,12 @@ pub struct Options {
     pub chamfer_angle: String,
     pub chamfer_depth: String,
     pub steep_flank: SteepFlank,
+    /// Choose a custom size from the selected cylinder rather than a catalogue size.
+    pub geometry_size: bool,
+    /// Uncommitted text must survive empty and invalid intermediate edits.
+    pub tpi_draft: Option<String>,
+    pub tpi_source: String,
+    pub tpi_error: Option<String>,
 }
 
 impl Default for Options {
@@ -311,6 +317,10 @@ impl Default for Options {
             chamfer_angle: String::new(),
             chamfer_depth: String::new(),
             steep_flank: SteepFlank::default(),
+            geometry_size: false,
+            tpi_draft: None,
+            tpi_source: String::new(),
+            tpi_error: None,
         }
     }
 }
@@ -432,6 +442,20 @@ pub(crate) fn rows(
         o.form = form;
     }
     let f = o.form;
+    if !is_pipe(f) {
+        let mut mode = usize::from(o.geometry_size);
+        choice_row(ui, "Sizing", "thread_sizing_mode", &mut mode, &["Standard", "Geometry"]);
+        if (mode == 1) != o.geometry_size {
+            o.geometry_size = mode == 1;
+            o.tpi_draft = None;
+            o.tpi_error = None;
+            *suggested = None;
+            designation.clear();
+            reset = true;
+        }
+    } else {
+        o.geometry_size = false;
+    }
 
     let before = designation.trim().is_empty() || suggested.as_deref() == Some(designation.as_str());
     let mut automatic = before;
@@ -450,23 +474,51 @@ pub(crate) fn rows(
     if !f.sizes().is_empty() {
         size_rows(ui, f, designation, suggested);
     }
-    // Offer a unit-independent pitch entry for forms whose designations accept a
-    // numeric millimetre pitch. The engine still receives its normal designation.
-    // Pipe threads have fixed catalogue pitches; ACME/ASME buttress already use TPI.
-    if !inch(f) && !is_pipe(f)
-        && let Some((diameter, pitch)) = parse(f, designation)
-    {
-        let mut tpi = 25.4 / pitch;
-        form_row(ui, "Pitch (TPI)", |ui| {
-            let response = ui.add(egui::DragValue::new(&mut tpi).speed(0.1).range(0.01..=10000.0).suffix(" TPI"));
-            if response.changed() && tpi.is_finite() && tpi > 0.0 {
-                let new_pitch = 25.4 / tpi;
-                if new_pitch < diameter {
-                    *designation = designation_of(f, diameter, new_pitch);
-                    *suggested = None;
+    // A text buffer is deliberately separate from the parsed designation. Editing
+    // "28" through "" or "2" must not rewrite the widget on the next frame.
+    if !inch(f) && !is_pipe(f) {
+        if o.tpi_draft.is_none() || (o.tpi_error.is_none() && o.tpi_source != *designation) {
+            o.tpi_draft = parse(f, designation).map(|(_, p)| format!("{:.8}", 25.4 / p));
+            o.tpi_source = designation.clone();
+            o.tpi_error = None;
+        }
+        if let Some(draft) = &mut o.tpi_draft {
+            let (submitted, changed) = text_row(ui, "Pitch (TPI)", draft, "threads per inch");
+            enter |= submitted && o.tpi_error.is_none();
+            if changed {
+                let parsed = draft.trim().parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0);
+                match parsed {
+                    Some(tpi) if 25.4 / tpi > 0.0 => {
+                        let pitch = 25.4 / tpi;
+                        if o.geometry_size {
+                            // Re-query the face with the new pitch next frame.
+                            o.tpi_error = None;
+                            *suggested = None;
+                            designation.clear();
+                            reset = true;
+                        } else if let Some((diameter, _)) = parse(f, designation) {
+                            if pitch < diameter {
+                                *designation = designation_of(f, diameter, pitch);
+                                *suggested = None;
+                                o.tpi_source = designation.clone();
+                                o.tpi_error = None;
+                            } else {
+                                o.tpi_error = Some("pitch must be smaller than the nominal diameter".into());
+                            }
+                        } else {
+                            o.tpi_error = Some("select a thread size first".into());
+                        }
+                    }
+                    _ => o.tpi_error = Some("enter a positive TPI value".into()),
                 }
             }
-        });
+            if let Some(error) = &o.tpi_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        }
+    } else {
+        o.tpi_draft = None;
+        o.tpi_error = None;
     }
     let hint = solidcraft_ui_text::format("thread.fits_the_face", &[("example", &example(f))]);
     let (submitted, changed) = text_row(ui, "Designation", designation, &hint);
@@ -665,7 +717,24 @@ fn up_to(inputs: &[SelInput]) -> Option<Value> {
 /// The face's size in the dialog's form, for an automatic size.
 pub(crate) fn suggested(s: &Session, picks: &[Sel], o: &Options) -> Option<String> {
     picks.first().and_then(|sel| match sel {
-        Sel::Face { point, .. } => solidcraft_engine::doc::suggested_thread_in(&crate::open_meshing::session_world(s), *point, o.form).ok(),
+        Sel::Face { body, point, .. } => {
+            let world = crate::open_meshing::session_world(s);
+            if !o.geometry_size || is_pipe(o.form) {
+                return solidcraft_engine::doc::suggested_thread_in(&world, *point, o.form).ok();
+            }
+            let cylinder = world.bodies.iter().filter(|b| b.name == *body)
+                .find_map(|b| solidcraft_engine::doc::kernel::cylinder_face_at(&b.body, *point));
+            let cyl = cylinder?;
+            let diameter = cyl.radius * 2.0;
+            let pitch = o.tpi_draft.as_ref().and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .map(|n| 25.4 / n)
+                .or_else(|| o.form.fit(diameter, cyl.internal).map(|(_, p)| p))?;
+            // For an internal face, the selected bore is the minor diameter.
+            // The drill relation is translational in nominal diameter for fixed pitch.
+            let major = if cyl.internal { diameter + diameter - o.form.drill(diameter, pitch) } else { diameter };
+            (major > pitch && major.is_finite()).then(|| designation_of(o.form, major, pitch))
+        }
         _ => None,
     })
 }
@@ -714,6 +783,10 @@ pub(crate) fn reopen(d: &mut Dialog, s: &Session, kind: &FeatureKind) {
         chamfer_angle: chamfer_angle.as_ref().map(expr).unwrap_or_default(),
         chamfer_depth: chamfer_depth.as_ref().map(expr).unwrap_or_default(),
         steep_flank: *steep_flank,
+        geometry_size: false,
+        tpi_draft: None,
+        tpi_source: String::new(),
+        tpi_error: None,
     };
     if let Some(inp) = d.inputs.first_mut() {
         inp.items = face_sel(s, face.0).into_iter().collect();
